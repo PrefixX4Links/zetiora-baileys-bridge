@@ -1,38 +1,32 @@
-import express from 'express';
-import pino from 'pino';
-import fs from 'fs';
-import path from 'path';
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   Browsers,
   fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
+import pino from 'pino';
+import express from 'express';
+import fs from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
 
-const app = express();
-app.use(express.json());
+dotenv.config();
 
-const PORT = process.env.PORT || 3000;
 const BRIDGE_URL = process.env.BRIDGE_URL;
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
-const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
-
-const logger = pino({ level: 'info' });
-
-if (!BRIDGE_URL || !BRIDGE_SECRET) {
-  logger.error('CRITICAL: BRIDGE_URL or BRIDGE_SECRET is missing!');
-}
+const PORT = process.env.PORT || 3000;
+const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(process.cwd(), 'sessions');
 
 if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-// In-memory sessions tracking
-// sellerId -> { sock, status, codeSent, pairPhone, starting }
+const logger = pino({ level: 'info' });
 const activeSockets = new Map();
+const pairingCodeRequested = new Set();
 
-// Helper to communicate with Zetiora Cloud Edge Function
-async function callBridge(body) {
+async function postToBridge(payload) {
+  if (!BRIDGE_URL || !BRIDGE_SECRET) return null;
   try {
     const res = await fetch(BRIDGE_URL, {
       method: 'POST',
@@ -40,197 +34,197 @@ async function callBridge(body) {
         'Content-Type': 'application/json',
         'x-bridge-secret': BRIDGE_SECRET,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
     });
     return await res.json();
   } catch (err) {
-    logger.error({ err: err.message, action: body.action }, 'Bridge call failed');
+    logger.error('Bridge POST error:', err.message);
     return null;
   }
 }
 
-// Start or reconnect a WhatsApp session for a seller
 async function startSession(sessionInfo) {
-  const { seller_id, pair_method, pair_phone } = sessionInfo;
-
-  if (activeSockets.has(seller_id)) {
-    const existing = activeSockets.get(seller_id);
-    if (existing.sock) return; // Tayari ipo hewani
+  const sellerId = sessionInfo.seller_id;
+  const sessionDir = path.join(SESSIONS_DIR, `seller_${sellerId}`);
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
   }
 
-  const sessionFolder = path.join(SESSIONS_DIR, seller_id);
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+  // Ikiwa socket tayari ipo na imeunganishwa, usirudie
+  const existing = activeSockets.get(sellerId);
+  if (existing?.user?.id) {
+    return;
+  }
+
+  logger.info(`[${sellerId}] Starting WhatsApp session (method: ${sessionInfo.pair_method || 'qr'})...`);
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
   const { version } = await fetchLatestBaileysVersion();
 
-  const sessionState = {
-    sock: null,
-    status: 'starting',
-    codeSent: false,
-    pairPhone: pair_phone || null,
-  };
-  activeSockets.set(seller_id, sessionState);
-
-  // Browser lazima iwe macOS Desktop inayotambuliwa na WhatsApp bila shaka
   const sock = makeWASocket({
     version,
+    auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    auth: state,
     browser: Browsers.macOS('Desktop'),
     syncFullHistory: false,
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
+    markOnlineOnConnect: true,
   });
 
-  sessionState.sock = sock;
+  activeSockets.set(sellerId, sock);
 
-  // Pairing code request (ikitakiwa)
-  if (pair_method === 'code' && pair_phone && !sock.authState.creds.registered) {
-    setTimeout(async () => {
-      try {
-        if (!sessionState.codeSent && !sock.authState.creds.registered) {
-          sessionState.codeSent = true;
-          const cleanPhone = String(pair_phone).replace(/[^0-9]/g, '');
-          logger.info(`Requesting WhatsApp pairing code for +${cleanPhone}...`);
-          
+  // Tumia ev.process kuhakikisha saveCreds inakamilika kabla ya connection.update
+  sock.ev.process(async (events) => {
+    // 1. Hifadhi funguo mara moja zikibadilika
+    if (events['creds.update']) {
+      await saveCreds();
+    }
+
+    // 2. Mabadiliko ya muunganisho
+    if (events['connection.update']) {
+      const update = events['connection.update'];
+      const { connection, lastDisconnect, qr } = update;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+
+      // QR Code
+      if (qr && sessionInfo.pair_method === 'qr') {
+        logger.info(`[${sellerId}] QR Code ready.`);
+        await postToBridge({
+          action: 'qr',
+          seller_id: sellerId,
+          qr,
+        });
+      }
+
+      // Imeunganishwa kikamilifu
+      if (connection === 'open') {
+        logger.info(`[${sellerId}] WhatsApp connected successfully!`);
+        pairingCodeRequested.delete(sellerId);
+        const phone = sock.user?.id?.split(':')[0] || sessionInfo.pair_phone;
+        await postToBridge({
+          action: 'status',
+          seller_id: sellerId,
+          status: 'connected',
+          phone_number: phone,
+        });
+      }
+
+      // Muunganisho umefungwa
+      if (connection === 'close') {
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        const isRestartRequired = statusCode === DisconnectReason.restartRequired; // Code 515
+
+        logger.info(`[${sellerId}] Connection closed. StatusCode: ${statusCode} (restartRequired: ${isRestartRequired})`);
+
+        if (isLoggedOut) {
+          logger.warn(`[${sellerId}] Device logged out. Cleaning up.`);
+          pairingCodeRequested.delete(sellerId);
+          activeSockets.delete(sellerId);
+          try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (_) {}
+          await postToBridge({
+            action: 'status',
+            seller_id: sellerId,
+            status: 'disconnected',
+          });
+          return;
+        }
+
+        // MUHIMU: Baada ya kuingiza Pairing Code simuni, WhatsApp inatuma 515.
+        // Ni lazima tu-reconnect mara moja ili WhatsApp ikamilishe muunganisho!
+        if (isRestartRequired) {
+          logger.info(`[${sellerId}] Pairing handshake succeeded (Code 515). Reconnecting with new credentials...`);
+          setTimeout(() => startSession(sessionInfo), 500);
+          return;
+        }
+
+        // Ikiwa code bado inasubiri mtu aiandike kwenye simu, usilazimishe restart ya hovyo
+        if (sessionInfo.pair_method === 'code' && pairingCodeRequested.has(sellerId) && !state.creds.registered) {
+          logger.info(`[${sellerId}] Waiting for seller to finish entering code on phone...`);
+          return;
+        }
+
+        // Hitilafu nyingine za kawaida za mtandao: jaribu tena baada ya sekunde 5
+        setTimeout(() => startSession(sessionInfo), 5000);
+      }
+    }
+
+    // 3. Kupokea ujumbe kutoka kwa wateja
+    if (events['messages.upsert']) {
+      const { messages, type } = events['messages.upsert'];
+      if (type !== 'notify') return;
+
+      for (const m of messages) {
+        if (m.key.fromMe) continue;
+        const jid = m.key.remoteJid;
+        if (!jid || jid.endsWith('@g.us')) continue;
+
+        const text = m.message?.conversation ||
+          m.message?.extendedTextMessage?.text ||
+          m.message?.imageMessage?.caption ||
+          '';
+
+        if (!text.trim()) continue;
+
+        const customerPhone = jid.split('@')[0];
+        const pushName = m.pushName || 'Mteja';
+
+        const replyData = await postToBridge({
+          action: 'message',
+          seller_id: sellerId,
+          from: customerPhone,
+          name: pushName,
+          text,
+        });
+
+        if (replyData?.reply && activeSockets.has(sellerId)) {
+          const s = activeSockets.get(sellerId);
+          await s.sendMessage(jid, { text: replyData.reply });
+        }
+      }
+    }
+  });
+
+  // 4. Omba Pairing Code ikiwa mtindo ni 'code' na haijasajiliwa bado
+  if (sessionInfo.pair_method === 'code' && sessionInfo.pair_phone && !state.creds.registered) {
+    if (!pairingCodeRequested.has(sellerId)) {
+      setTimeout(async () => {
+        try {
+          const cleanPhone = String(sessionInfo.pair_phone).replace(/[^0-9]/g, '');
+          logger.info(`[${sellerId}] Requesting pairing code for phone: ${cleanPhone}`);
           const code = await sock.requestPairingCode(cleanPhone);
-          logger.info(`Pairing code received: ${code}`);
+          pairingCodeRequested.add(sellerId);
+          logger.info(`[${sellerId}] Pairing code generated: ${code}`);
 
-          await callBridge({
+          await postToBridge({
             action: 'qr',
-            seller_id,
+            seller_id: sellerId,
             pair_code: code,
           });
+        } catch (err) {
+          logger.error(`[${sellerId}] Failed to request pairing code:`, err);
         }
-      } catch (err) {
-        logger.error({ err: err.message }, 'Failed to request pairing code');
-        sessionState.codeSent = false;
-      }
-    }, 3000);
+      }, 3000);
+    }
   }
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    // QR Code method
-    if (qr && pair_method !== 'code') {
-      await callBridge({
-        action: 'qr',
-        seller_id,
-        qr,
-      });
-    }
-
-    if (connection === 'open') {
-      logger.info(`Seller ${seller_id} WhatsApp connected successfully!`);
-      sessionState.status = 'connected';
-      sessionState.codeSent = false;
-
-      const userJid = sock.user?.id || '';
-      const phone = userJid.split(':')[0] || userJid.split('@')[0];
-
-      await callBridge({
-        action: 'status',
-        seller_id,
-        status: 'connected',
-        phone_number: phone,
-      });
-    }
-
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      logger.warn(`Connection closed for seller ${seller_id}. Status code: ${statusCode}`);
-
-      activeSockets.delete(seller_id);
-
-      if (!shouldReconnect) {
-        logger.info(`Session logged out for ${seller_id}. Cleaning up files.`);
-        try {
-          fs.rmSync(sessionFolder, { recursive: true, force: true });
-        } catch (_) {}
-        await callBridge({ action: 'status', seller_id, status: 'disconnected' });
-      } else {
-        // Ikiwa pairing code ilikuwa tayari imetoka, usijirudie kutoa mpya mara moja
-        if (!sessionState.codeSent) {
-          setTimeout(() => startSession(sessionInfo), 5000);
-        }
-      }
-    }
-  });
-
-  // Handle incoming customer messages
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue;
-      const jid = msg.key.remoteJid;
-      if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
-
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        '';
-
-      if (!text.trim()) continue;
-
-      logger.info(`Message from ${jid}: "${text}"`);
-
-      const resp = await callBridge({
-        action: 'message',
-        seller_id,
-        from: jid,
-        text,
-      });
-
-      if (resp?.reply) {
-        await sock.sendMessage(jid, { text: resp.reply });
-      }
-
-      if (Array.isArray(resp?.images) && resp.images.length > 0) {
-        for (const imgUrl of resp.images) {
-          try {
-            await sock.sendMessage(jid, { image: { url: imgUrl } });
-          } catch (e) {
-            logger.error(`Failed to send image: ${imgUrl}`);
-          }
-        }
-      }
-    }
-  });
 }
 
-// Polling loop: Angalia kila baada ya sekunde 6 kama kuna duka linalotaka kuunganisha
-async function syncSessions() {
-  const res = await callBridge({ action: 'sessions' });
-  if (res?.sessions && Array.isArray(res.sessions)) {
-    for (const s of res.sessions) {
-      if (s.status === 'pending' || s.status === 'qr') {
-        startSession(s);
-      } else if (s.status === 'connected' && !activeSockets.has(s.seller_id)) {
-        // Reconnect established session from disk
-        startSession(s);
+// Polling ya maduka yanayohitaji kuunganishwa (kila sekunde 6)
+async function pollSessions() {
+  const data = await postToBridge({ action: 'sessions' });
+  if (data?.sessions && Array.isArray(data.sessions)) {
+    for (const session of data.sessions) {
+      if (['pending', 'qr'].includes(session.status)) {
+        startSession(session);
       }
     }
   }
 }
 
-setInterval(syncSessions, 6000);
-syncSessions();
+setInterval(pollSessions, 6000);
 
-// Health check endpoint ya Railway
-app.get('/', (req, res) => {
-  res.json({
-    status: 'online',
-    active_sellers: activeSockets.size,
-    time: new Date().toISOString(),
-  });
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`Zetiora Baileys Bridge listening on port ${PORT}`);
+const app = express();
+app.get('/health', (req, res) => res.json({ status: 'ok', active: activeSockets.size }));
+app.listen(PORT, () => {
+  logger.info(`WhatsApp Baileys bridge server running on port ${PORT}`);
+  pollSessions();
 });
